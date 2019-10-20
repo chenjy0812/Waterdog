@@ -1,4 +1,4 @@
-From f03d3a2b6eb767ee3c04f2f02a1bf66efa5c3852 Mon Sep 17 00:00:00 2001
+From 0bfd40c4207a1527270c95c0a1d40fcb33a7e59b Mon Sep 17 00:00:00 2001
 From: Colin Godsey <crgodsey@gmail.com>
 Date: Tue, 16 Apr 2019 07:50:11 -0600
 Subject: [PATCH] Waterdog PE (additions)
@@ -19,10 +19,10 @@ index 00000000..73495872
 +}
 diff --git a/protocol/src/main/java/network/ycc/waterdog/pe/PEBlockRewrite.java b/protocol/src/main/java/network/ycc/waterdog/pe/PEBlockRewrite.java
 new file mode 100644
-index 00000000..8ac16ad0
+index 00000000..1d85c399
 --- /dev/null
 +++ b/protocol/src/main/java/network/ycc/waterdog/pe/PEBlockRewrite.java
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,182 @@
 +package network.ycc.waterdog.pe;
 +
 +import io.netty.buffer.ByteBuf;
@@ -32,15 +32,17 @@ index 00000000..8ac16ad0
 +
 +public abstract class PEBlockRewrite {
 +
++    public final static PEBlockRewrite EMPTY = new PEBlockRewrite() {
++        public int map(int id) {
++            return id;
++        }
++    };
++
 +    protected static final int nV8Blocks = 16 * 16 * 16;
 +
 +    public abstract int map(int id);
 +
 +    public void rewriteClientbound(ByteBuf packet, int version) {
-+        if (version >= ProtocolConstants.MINECRAFT_PE_1_12) {
-+            return; //TODO: finish 1.12 format
-+        }
-+
 +        final int readerIndex = packet.readerIndex();
 +        final int packetId = DefinedPacket.readVarInt(packet);
 +        final int writerIndex = packet.readerIndex();
@@ -50,17 +52,25 @@ index 00000000..8ac16ad0
 +                DefinedPacket.readSVarInt(packet); //chunk X
 +                DefinedPacket.readSVarInt(packet); //chunk Z
 +                final ByteBuf out = packet.alloc().ioBuffer(packet.readableBytes() + 128);
++                int sections, rwStart;
 +                try {
-+                    final int rwStart = packet.readerIndex();
-+                    DefinedPacket.readVarInt(packet); //payload length
-+                    final int sections = DefinedPacket.readVarInt(packet);
-+                    out.writeByte(sections);
++                    if (version >= ProtocolConstants.MINECRAFT_PE_1_12) {
++                        sections = packet.readShortLE();
++                        rwStart = packet.readerIndex();
++                        DefinedPacket.readVarInt(packet); //payload length
++                    } else {
++                        rwStart = packet.readerIndex();
++                        DefinedPacket.readVarInt(packet); //payload length
++                        sections = DefinedPacket.readVarInt(packet);
++                        out.writeByte(sections);
++                    }
 +                    rewriteChunkSections(packet, out, sections);
 +
 +                    packet.readerIndex(readerIndex);
 +                    packet.writerIndex(rwStart);
 +                    DefinedPacket.writeVarInt(out.readableBytes(), packet); //payload length
 +                    packet.writeBytes(out);
++
 +                } finally {
 +                    out.release();
 +                }
@@ -93,7 +103,8 @@ index 00000000..8ac16ad0
 +                final float x = packet.readFloatLE();
 +                final float y = packet.readFloatLE();
 +                final float z = packet.readFloatLE();
-+                int data = DefinedPacket.readSVarInt(packet);
++                //should be a svarint, but nukkit does weird things sometimes
++                int data = (int) DefinedPacket.readSVarLong(packet);
 +
 +                switch (evID) {
 +                    case PEDataValues.LEVEL_EVENT_EVENT_TERRAIN_PARTICLE:
@@ -117,6 +128,33 @@ index 00000000..8ac16ad0
 +                DefinedPacket.writeSVarInt(data, packet);
 +                return;
 +            }
++            case 0x7b: { //PLAY_LEVEL_SOUND_EVENT_PACKET
++                final int sound = DefinedPacket.readVarInt(packet);
++                final float x = packet.readFloatLE();
++                final float y = packet.readFloatLE();
++                final float z = packet.readFloatLE();
++                int data = DefinedPacket.readSVarInt(packet);
++                final byte[] remaining = new byte[packet.readableBytes()];
++                packet.readBytes(remaining);
++
++                switch (sound) {
++                    case 6: // SOUND_PLACE
++                        data = map(data);
++                        break;
++                    default: // NOOP
++                }
++
++                packet.readerIndex(readerIndex);
++                packet.writerIndex(writerIndex);
++
++                DefinedPacket.writeVarInt(sound, packet);
++                packet.writeFloatLE(x);
++                packet.writeFloatLE(y);
++                packet.writeFloatLE(z);
++                DefinedPacket.writeSVarInt(data, packet);
++                packet.writeBytes(remaining);
++                return;
++            }
 +            case 0x0D: //PLAY_ENTITY_SPAWN TODO: entity spawn for fall blocks, DATA_VARIANT
 +            default: // NOOP
 +        }
@@ -130,6 +168,7 @@ index 00000000..8ac16ad0
 +            out.writeByte(subchunkVersion);
 +            switch (subchunkVersion) {
 +                case 0: //legacy block ids, no remap needed
++                case 4: //minet uses this format. what is it?
 +                    out.writeBytes(in);
 +                    return;
 +                case 8: //new form chunk, baked-in palette
@@ -228,10 +267,10 @@ index 00000000..9d983810
 +}
 diff --git a/protocol/src/main/java/network/ycc/waterdog/pe/PERawPacketData.java b/protocol/src/main/java/network/ycc/waterdog/pe/PERawPacketData.java
 new file mode 100644
-index 00000000..1b637023
+index 00000000..55ca27bd
 --- /dev/null
 +++ b/protocol/src/main/java/network/ycc/waterdog/pe/PERawPacketData.java
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,176 @@
 +package network.ycc.waterdog.pe;
 +
 +import com.google.common.base.Preconditions;
@@ -254,8 +293,8 @@ index 00000000..1b637023
 +    private static final byte[] fakePEChunkData112;
 +
 +    static {
-+        ByteBuf serializer = Unpooled.buffer();
-+        ByteBuf chunkdata = Unpooled.buffer();
++        final ByteBuf serializer = Unpooled.buffer();
++        final ByteBuf chunkdata = Unpooled.buffer();
 +
 +        chunkdata.writeByte(1); //1 section
 +        chunkdata.writeByte(8); //New subchunk version!
@@ -310,7 +349,7 @@ index 00000000..1b637023
 +    }
 +
 +    public static void injectChunkPublisherUpdate(Channel channel, int x, int y, int z) {
-+        ByteBuf publisherUpdate = Unpooled.buffer();
++        final ByteBuf publisherUpdate = channel.alloc().ioBuffer();
 +        DefinedPacket.writeVarInt(0x79, publisherUpdate); //CHUNK_PUBLISHER_UPDATE_PACKET
 +        DefinedPacket.writeSVarInt(x, publisherUpdate);
 +        DefinedPacket.writeVarInt(y, publisherUpdate);
@@ -323,7 +362,7 @@ index 00000000..1b637023
 +        injectChunkPublisherUpdate(channel, 0, 0, 0);
 +        for (int x = -4; x <= 4; x++) {
 +            for (int z = -4; z <= 4; z++) {
-+                ByteBuf buffer = Unpooled.buffer();
++                ByteBuf buffer = channel.alloc().ioBuffer();
 +                DefinedPacket.writeVarInt(0x3A, buffer); //PLAY_CHUNK_DATA
 +                DefinedPacket.writeSVarInt(x, buffer);
 +                DefinedPacket.writeSVarInt(z, buffer);
@@ -335,27 +374,27 @@ index 00000000..1b637023
 +                channel.write(buffer);
 +            }
 +        }
-+        ByteBuf lockPacket = Unpooled.buffer();
++        final ByteBuf lockPacket = channel.alloc().ioBuffer();
 +        DefinedPacket.writeVarInt(EXT_PS_AWAIT_DIM_SWITCH_ACK_ID, lockPacket);
 +        channel.writeAndFlush(lockPacket);
 +    }
 +
 +    public static void injectGameMode(Channel channel, int gamemode) {
-+        ByteBuf gameMode = Unpooled.buffer();
++        final ByteBuf gameMode = channel.alloc().ioBuffer();
 +        DefinedPacket.writeVarInt(0x3E, gameMode); //PLAY_PLAYER_GAME_TYPE
 +        DefinedPacket.writeSVarInt(gamemode, gameMode);
 +        channel.writeAndFlush(gameMode);
 +    }
 +
 +    public static void injectRemoveEntity(Channel channel, long entityId) {
-+        ByteBuf removeEntity = Unpooled.buffer();
++        final ByteBuf removeEntity = channel.alloc().ioBuffer();
 +        DefinedPacket.writeVarInt(0x0E, removeEntity); //PLAY_ENTITY_DESTROY
 +        DefinedPacket.writeSVarLong(entityId, removeEntity);
 +        channel.write(removeEntity);
 +    }
 +
 +    public static void injectRemovePlayerList(Channel channel, UUID uuid) {
-+        ByteBuf removePlayerList = Unpooled.buffer();
++        final ByteBuf removePlayerList = channel.alloc().ioBuffer();
 +        DefinedPacket.writeVarInt(0x3F, removePlayerList); //PLAY_PLAYER_INFO
 +        DefinedPacket.writeVarInt(1, removePlayerList); //remove
 +        DefinedPacket.writeVarInt(1, removePlayerList); //1 item
@@ -364,6 +403,75 @@ index 00000000..1b637023
 +        channel.write(removePlayerList);
 +    }
 +
++    public static void injectResourcePackInfo(Channel channel, PEResourcePackData pack) {
++        final ByteBuf resourcePackInfo = channel.alloc().ioBuffer();
++        DefinedPacket.writeVarInt(0x52, resourcePackInfo); //PLAY_RESOURCE_PACK_INFO
++        DefinedPacket.writeString(pack.getUuid().toString(), resourcePackInfo);
++        resourcePackInfo.writeIntLE(PEResourcePackData.CHUNK_SIZE);
++        resourcePackInfo.writeIntLE(pack.getNumberChunks());
++        resourcePackInfo.writeLongLE(pack.getSize());
++        DefinedPacket.writeVarInt(pack.getSha256().length, resourcePackInfo);
++        resourcePackInfo.writeBytes(pack.getSha256());
++        resourcePackInfo.writeBoolean(false); //premium
++        resourcePackInfo.writeByte(1); //resource pack
++        channel.write(resourcePackInfo);
++    }
++
++    public static void injectResourcePackData(Channel channel, PEResourcePackData pack, int chunkIndex, int version) {
++        final ByteBuf resourcePackData = channel.alloc().ioBuffer();
++        DefinedPacket.writeVarInt(0x53, resourcePackData); //PLAY_RESOURCE_PACK_DATA
++        DefinedPacket.writeString(pack.getUuid().toString(), resourcePackData);
++        resourcePackData.writeIntLE(chunkIndex);
++        resourcePackData.writeLongLE(PEResourcePackData.CHUNK_SIZE * chunkIndex);
++        pack.writeChunk(chunkIndex, resourcePackData, version);
++        channel.write(resourcePackData);
++    }
++
++    public static void injectRemoveAllEffects(Channel channel, long clientEntityId) {
++        for (int i = 0 ; i < 30 ; i++) {
++            injectRemoveEntityEffect(channel, clientEntityId, i);
++        }
++        channel.flush();
++    }
++
++    public static void injectRemoveEntityEffect(Channel channel, long entityId, int effectId) {
++        final ByteBuf removeEntityEffect = channel.alloc().ioBuffer();
++        DefinedPacket.writeVarInt(0x1C, removeEntityEffect); //PLAY_ENTITY_EFFECT
++        DefinedPacket.writeVarLong(entityId, removeEntityEffect);
++        removeEntityEffect.writeByte(3); //remove effect
++        DefinedPacket.writeSVarInt(effectId, removeEntityEffect);
++        DefinedPacket.writeSVarInt(0, removeEntityEffect); // unused
++        removeEntityEffect.writeBoolean(false); // unused
++        DefinedPacket.writeSVarInt(0, removeEntityEffect); // unused
++        channel.write(removeEntityEffect);
++    }
++
++}
+diff --git a/protocol/src/main/java/network/ycc/waterdog/pe/PEResourcePackData.java b/protocol/src/main/java/network/ycc/waterdog/pe/PEResourcePackData.java
+new file mode 100644
+index 00000000..33d96c53
+--- /dev/null
++++ b/protocol/src/main/java/network/ycc/waterdog/pe/PEResourcePackData.java
+@@ -0,0 +1,20 @@
++package network.ycc.waterdog.pe;
++
++import io.netty.buffer.ByteBuf;
++
++import java.util.UUID;
++
++public interface PEResourcePackData {
++    int CHUNK_SIZE = 1024 * 1024;
++
++    void writeChunk(int chunkIndex, ByteBuf to, int version);
++    String getName();
++    UUID getUuid();
++    String getVersion();
++    int getSize();
++    byte[] getSha256();
++
++    default int getNumberChunks() {
++        return (getSize() + CHUNK_SIZE - 1) / CHUNK_SIZE;
++    }
 +}
 diff --git a/protocol/src/main/java/network/ycc/waterdog/pe/packet/PECommand.java b/protocol/src/main/java/network/ycc/waterdog/pe/packet/PECommand.java
 new file mode 100644
@@ -447,7 +555,7 @@ index 00000000..75784080
 +}
 diff --git a/protocol/src/main/java/network/ycc/waterdog/pe/packet/PEEncryptionResponse.java b/protocol/src/main/java/network/ycc/waterdog/pe/packet/PEEncryptionResponse.java
 new file mode 100644
-index 00000000..bfd8b92b
+index 00000000..b0529006
 --- /dev/null
 +++ b/protocol/src/main/java/network/ycc/waterdog/pe/packet/PEEncryptionResponse.java
 @@ -0,0 +1,27 @@
@@ -475,15 +583,15 @@ index 00000000..bfd8b92b
 +    }
 +
 +    public void handle(AbstractPacketHandler handler) throws Exception {
-+
++        handler.handle(this);
 +    }
 +}
 diff --git a/protocol/src/main/java/network/ycc/waterdog/pe/packet/PEHandshake.java b/protocol/src/main/java/network/ycc/waterdog/pe/packet/PEHandshake.java
 new file mode 100644
-index 00000000..d3e8e2d8
+index 00000000..9aa4df45
 --- /dev/null
 +++ b/protocol/src/main/java/network/ycc/waterdog/pe/packet/PEHandshake.java
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,53 @@
 +package network.ycc.waterdog.pe.packet;
 +
 +import com.google.gson.JsonObject;
@@ -492,10 +600,11 @@ index 00000000..d3e8e2d8
 +
 +import lombok.Data;
 +import lombok.EqualsAndHashCode;
-+import lombok.NoArgsConstructor;
 +
 +import net.md_5.bungee.protocol.packet.Handshake;
 +
++import java.math.BigInteger;
++import java.security.PublicKey;
 +import java.util.UUID;
 +
 +@Data
@@ -503,21 +612,25 @@ index 00000000..d3e8e2d8
 +public class PEHandshake extends Handshake {
 +    private String username;
 +    private UUID uuid;
-+    private UUID deviceUUID;
++    private UUID loginUUID;
++    private BigInteger xuid;
 +    private boolean authorized;
 +    private JsonObject clientInfo;
 +    private byte[] handshakeData;
++    private PublicKey publicKey;
 +
 +    public PEHandshake() {
 +        setProtocolVersion(2);
 +    }
 +
-+    public PEHandshake(int protocolVersion, String host, int port, String username, UUID uuid, boolean authorized, JsonObject clientInfo) {
++    public PEHandshake(int protocolVersion, String host, int port, String username, UUID uuid,
++            boolean authorized, JsonObject clientInfo, BigInteger xuid) {
 +        super(protocolVersion, host, port, 2);
 +        this.username = username;
 +        this.uuid = uuid;
 +        this.authorized = authorized;
 +        this.clientInfo = clientInfo;
++        this.xuid = xuid;
 +    }
 +
 +    @Override
@@ -574,10 +687,10 @@ index 00000000..e0c0b55f
 +}
 diff --git a/protocol/src/main/java/network/ycc/waterdog/pe/packet/PELogin.java b/protocol/src/main/java/network/ycc/waterdog/pe/packet/PELogin.java
 new file mode 100644
-index 00000000..d2373c7c
+index 00000000..88528127
 --- /dev/null
 +++ b/protocol/src/main/java/network/ycc/waterdog/pe/packet/PELogin.java
-@@ -0,0 +1,160 @@
+@@ -0,0 +1,163 @@
 +package network.ycc.waterdog.pe.packet;
 +
 +import io.netty.buffer.ByteBuf;
@@ -620,7 +733,7 @@ index 00000000..d2373c7c
 +        readSVarInt(buf); //seed
 +        setDimension(PEDataValues.getPcDimensionId(readSVarInt(buf)));
 +        readSVarInt(buf); //world type (1 - infinite)
-+        readSVarInt(buf); // world gamemode (SURVIVAL)
++        readSVarInt(buf); //world gamemode (SURVIVAL)
 +        setDifficulty((short) readSVarInt(buf));
 +
 +        final int payloadStartIndex = buf.readerIndex();
@@ -628,8 +741,8 @@ index 00000000..d2373c7c
 +        buf.readBytes(tailPayload);
 +        buf.readerIndex(payloadStartIndex);
 +
-+        DefinedPacket.readSVarInt(buf);//spawn position
-+        DefinedPacket.readVarInt(buf);
++        DefinedPacket.readSVarInt(buf); //spawn position
++        DefinedPacket.readSVarLong(buf); //should be VarInt, but nukkit...
 +        DefinedPacket.readSVarInt(buf);
 +        buf.readBoolean(); //disable achievements
 +        DefinedPacket.readSVarInt(buf); //time
@@ -696,6 +809,9 @@ index 00000000..d2373c7c
 +        buf.readBoolean(); //is world template option locked
 +        if (protocolVersion >= ProtocolConstants.MINECRAFT_PE_1_12) {
 +            buf.readByte(); //only spawn v1 villagers
++        }
++        if (protocolVersion >= ProtocolConstants.MINECRAFT_PE_1_13) {
++            DefinedPacket.readString(buf); //vanilla version
 +        }
 +        DefinedPacket.readString(buf); //level ID (empty string)
 +        DefinedPacket.readString(buf); //world name (empty string)
@@ -780,14 +896,18 @@ index 00000000..7fe81e63
 +}
 diff --git a/protocol/src/main/java/network/ycc/waterdog/pe/packet/PEResourcePack.java b/protocol/src/main/java/network/ycc/waterdog/pe/packet/PEResourcePack.java
 new file mode 100644
-index 00000000..55a572ef
+index 00000000..86529798
 --- /dev/null
 +++ b/protocol/src/main/java/network/ycc/waterdog/pe/packet/PEResourcePack.java
-@@ -0,0 +1,37 @@
+@@ -0,0 +1,59 @@
 +package network.ycc.waterdog.pe.packet;
++
++import network.ycc.waterdog.pe.PEResourcePackData;
 +
 +import io.netty.buffer.ByteBuf;
 +
++import lombok.AllArgsConstructor;
++import lombok.NoArgsConstructor;
 +import lombok.Data;
 +import lombok.EqualsAndHashCode;
 +
@@ -796,8 +916,14 @@ index 00000000..55a572ef
 +import net.md_5.bungee.protocol.ProtocolConstants;
 +
 +@Data
++@AllArgsConstructor
++@NoArgsConstructor
 +@EqualsAndHashCode(callSuper = false)
 +public class PEResourcePack extends DefinedPacket {
++    private boolean required = true;
++    private PEResourcePackData[] resourcePacks = null;
++    private PEResourcePackData[] behaviorPacks = null;
++
 +    @Override
 +    public void read(ByteBuf buf) {
 +        buf.skipBytes(buf.readableBytes());
@@ -805,31 +931,80 @@ index 00000000..55a572ef
 +
 +    @Override
 +    public void write(ByteBuf buf, ProtocolConstants.Direction direction, int protocolVersion) {
-+        buf.writeBoolean(false); // required
-+        buf.writeShortLE(0); //beh packs count
-+        if (protocolVersion >= ProtocolConstants.MINECRAFT_PE_1_9) {
-+            buf.writeBoolean(false); // ???
-+        }
-+        buf.writeShortLE(0); //res packs count
-+        if (protocolVersion >= ProtocolConstants.MINECRAFT_PE_1_9) {
-+            buf.writeBoolean(false); // ???
-+        }
++        buf.writeBoolean(required);
++        buf.writeBoolean(false); // has scripts
++        writePacks(buf, behaviorPacks, protocolVersion);
++        writePacks(buf, resourcePacks, protocolVersion);
 +    }
 +
 +    @Override
 +    public void handle(AbstractPacketHandler handler) throws Exception {
 +        handler.handle(this);
 +    }
++
++    protected void writePacks(ByteBuf buf, PEResourcePackData[] packs, int protocolVersion) {
++        buf.writeShortLE(packs == null ? 0 : packs.length);
++        if (packs != null) {
++            for (PEResourcePackData pack : packs) {
++                writeString(pack.getUuid().toString(), buf);
++                writeString(pack.getVersion(), buf);
++                buf.writeLongLE(pack.getSize());
++                writeString("", buf); //encryption key
++                writeString("", buf); //sub-pack name
++                writeString("", buf); //content identity
++                if (protocolVersion >= ProtocolConstants.MINECRAFT_PE_1_9) {
++                    buf.writeBoolean(false); // has scripts
++                }
++            }
++        }
++    }
 +}
-diff --git a/protocol/src/main/java/network/ycc/waterdog/pe/packet/PEResourcePackResponse.java b/protocol/src/main/java/network/ycc/waterdog/pe/packet/PEResourcePackResponse.java
+diff --git a/protocol/src/main/java/network/ycc/waterdog/pe/packet/PEResourcePackChunkRequest.java b/protocol/src/main/java/network/ycc/waterdog/pe/packet/PEResourcePackChunkRequest.java
 new file mode 100644
-index 00000000..0948f2c4
+index 00000000..3e885021
 --- /dev/null
-+++ b/protocol/src/main/java/network/ycc/waterdog/pe/packet/PEResourcePackResponse.java
-@@ -0,0 +1,40 @@
++++ b/protocol/src/main/java/network/ycc/waterdog/pe/packet/PEResourcePackChunkRequest.java
+@@ -0,0 +1,28 @@
 +package network.ycc.waterdog.pe.packet;
 +
 +import io.netty.buffer.ByteBuf;
++
++import java.util.UUID;
++
++import lombok.Data;
++import lombok.EqualsAndHashCode;
++
++import net.md_5.bungee.protocol.AbstractPacketHandler;
++import net.md_5.bungee.protocol.DefinedPacket;
++
++@Data
++@EqualsAndHashCode(callSuper = false)
++public class PEResourcePackChunkRequest extends DefinedPacket {
++    private UUID packUUID;
++    private int chunkIndex;
++
++    @Override
++    public void read(ByteBuf buf) {
++        packUUID = UUID.fromString(readString(buf));
++        chunkIndex = buf.readIntLE();
++    }
++
++    public void handle(AbstractPacketHandler handler) throws Exception {
++        handler.handle(this);
++    }
++}
+diff --git a/protocol/src/main/java/network/ycc/waterdog/pe/packet/PEResourcePackResponse.java b/protocol/src/main/java/network/ycc/waterdog/pe/packet/PEResourcePackResponse.java
+new file mode 100644
+index 00000000..32e761d5
+--- /dev/null
++++ b/protocol/src/main/java/network/ycc/waterdog/pe/packet/PEResourcePackResponse.java
+@@ -0,0 +1,60 @@
++package network.ycc.waterdog.pe.packet;
++
++import io.netty.buffer.ByteBuf;
++
++import java.util.ArrayList;
++
 +import lombok.AllArgsConstructor;
 +import lombok.Data;
 +import lombok.EqualsAndHashCode;
@@ -849,17 +1024,34 @@ index 00000000..0948f2c4
 +    public static final byte STATUS_COMPLETED = 4;
 +
 +    private int status;
++    private String[] packs = new String[0];
++
++    public PEResourcePackResponse(int status) {
++        this(status, null);
++    }
 +
 +    @Override
 +    public void read(ByteBuf buf) {
 +        status = buf.readUnsignedByte();
-+        buf.skipBytes(buf.readableBytes());
++        final int entryCount = buf.readShortLE();
++        final ArrayList<String> packList = new ArrayList<>();
++        for (int i = 0 ; i < entryCount ; i++) {
++            packList.add(readString(buf));
++        }
++        packs = packList.toArray(packs);
 +    }
 +
 +    @Override
 +    public void write(ByteBuf buf) {
 +        buf.writeByte(status);
-+        buf.writeShortLE(0); //n packs
++        if (packs == null) {
++            buf.writeShortLE(0);
++        } else {
++            buf.writeShortLE(packs.length);
++            for (String pack : packs) {
++                writeString(pack, buf);
++            }
++        }
 +    }
 +
 +    @Override
@@ -869,14 +1061,18 @@ index 00000000..0948f2c4
 +}
 diff --git a/protocol/src/main/java/network/ycc/waterdog/pe/packet/PEResourceStack.java b/protocol/src/main/java/network/ycc/waterdog/pe/packet/PEResourceStack.java
 new file mode 100644
-index 00000000..c94bd6f0
+index 00000000..a17e9e3e
 --- /dev/null
 +++ b/protocol/src/main/java/network/ycc/waterdog/pe/packet/PEResourceStack.java
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,53 @@
 +package network.ycc.waterdog.pe.packet;
++
++import network.ycc.waterdog.pe.PEResourcePackData;
 +
 +import io.netty.buffer.ByteBuf;
 +
++import lombok.AllArgsConstructor;
++import lombok.NoArgsConstructor;
 +import lombok.Data;
 +import lombok.EqualsAndHashCode;
 +
@@ -884,8 +1080,15 @@ index 00000000..c94bd6f0
 +import net.md_5.bungee.protocol.DefinedPacket;
 +
 +@Data
++@AllArgsConstructor
++@NoArgsConstructor
 +@EqualsAndHashCode(callSuper = false)
 +public class PEResourceStack extends DefinedPacket {
++    private boolean required = true;
++    private boolean isExperimental = true;
++    private PEResourcePackData[] resourcePacks = null;
++    private PEResourcePackData[] behaviorPacks = null;
++
 +    @Override
 +    public void read(ByteBuf buf) {
 +        buf.skipBytes(buf.readableBytes());
@@ -893,16 +1096,26 @@ index 00000000..c94bd6f0
 +
 +    @Override
 +    public void write(ByteBuf buf) {
-+        buf.writeBoolean(false); // required
-+        writeVarInt(0, buf); //beh packs count
-+        writeVarInt(0, buf); //res packs count
-+        writeVarInt(0, buf); //?
-+        writeVarInt(0, buf); //?
++        buf.writeBoolean(required);
++        writePacks(buf, behaviorPacks);
++        writePacks(buf, resourcePacks);
++        buf.writeBoolean(isExperimental);
 +    }
 +
 +    @Override
 +    public void handle(AbstractPacketHandler handler) throws Exception {
 +        handler.handle(this);
++    }
++
++    protected void writePacks(ByteBuf buf, PEResourcePackData[] packs) {
++        writeVarInt(packs == null ? 0 : packs.length, buf);
++        if (packs != null) {
++            for (PEResourcePackData pack : packs) {
++                writeString(pack.getUuid().toString(), buf);
++                writeString(pack.getVersion(), buf);
++                writeString("", buf); //sub package name
++            }
++        }
 +    }
 +}
 diff --git a/protocol/src/main/java/network/ycc/waterdog/pe/packet/PESetDisplayObjectivePacket.java b/protocol/src/main/java/network/ycc/waterdog/pe/packet/PESetDisplayObjectivePacket.java
@@ -957,6 +1170,48 @@ index 00000000..c6eb87eb
 +        handler.handle(this);
 +    }
 +}
+diff --git a/protocol/src/main/java/network/ycc/waterdog/pe/packet/PEStopSoundPacket.java b/protocol/src/main/java/network/ycc/waterdog/pe/packet/PEStopSoundPacket.java
+new file mode 100644
+index 00000000..dab227a1
+--- /dev/null
++++ b/protocol/src/main/java/network/ycc/waterdog/pe/packet/PEStopSoundPacket.java
+@@ -0,0 +1,35 @@
++package network.ycc.waterdog.pe.packet;
++
++import io.netty.buffer.ByteBuf;
++import lombok.AllArgsConstructor;
++import lombok.Data;
++import lombok.EqualsAndHashCode;
++import lombok.NoArgsConstructor;
++import net.md_5.bungee.protocol.AbstractPacketHandler;
++import net.md_5.bungee.protocol.DefinedPacket;
++
++@Data
++@NoArgsConstructor
++@AllArgsConstructor
++@EqualsAndHashCode(callSuper = false)
++public class PEStopSoundPacket extends DefinedPacket {
++
++    public String name;
++    public boolean stopAll;
++
++    @Override
++    public void read( ByteBuf buf ) {
++        //Ignore
++    }
++
++    @Override
++    public void write( ByteBuf buf ) {
++        writeString( name, buf );
++        buf.writeBoolean( stopAll );
++    }
++
++    @Override
++    public void handle( AbstractPacketHandler handler ) throws Exception {
++
++    }
++}
+\ No newline at end of file
 diff --git a/protocol/src/main/java/network/ycc/waterdog/pe/packet/PETransfer.java b/protocol/src/main/java/network/ycc/waterdog/pe/packet/PETransfer.java
 new file mode 100644
 index 00000000..0a5d0f6f
@@ -1004,10 +1259,10 @@ index 00000000..0a5d0f6f
 +}
 diff --git a/proxy/src/main/java/net/md_5/bungee/entitymap/EntityMap_PE.java b/proxy/src/main/java/net/md_5/bungee/entitymap/EntityMap_PE.java
 new file mode 100644
-index 00000000..c439ecbb
+index 00000000..fe6344fa
 --- /dev/null
 +++ b/proxy/src/main/java/net/md_5/bungee/entitymap/EntityMap_PE.java
-@@ -0,0 +1,234 @@
+@@ -0,0 +1,248 @@
 +package net.md_5.bungee.entitymap;
 +
 +import io.netty.buffer.ByteBuf;
@@ -1170,11 +1425,25 @@ index 00000000..c439ecbb
 +        packet.readerIndex(readerIndex);
 +    }
 +
-+    public void playerListTrackRewrite(ByteBuf packet, Consumer<UUID> add, Consumer<UUID> remove, UUID playerUUID, UUID deviceUUID) {
++    public void playerListTrackRewrite(ByteBuf packet, Consumer<UUID> add, Consumer<UUID> remove, UUID playerUUID, UUID loginUUID) {
 +        if (!packet.isReadable()) {
 +            return;
 +        }
 +        final int readerIndex = packet.readerIndex();
++        final Runnable rewrite = () -> {
++            final int preUUIDReaderIndex = packet.readerIndex();
++            final long msb = packet.readLongLE();
++            final long lsb = packet.readLongLE();
++            if (msb == playerUUID.getMostSignificantBits()
++                    && lsb == playerUUID.getLeastSignificantBits()) {
++                packet.setLongLE(preUUIDReaderIndex, loginUUID.getMostSignificantBits());
++                packet.setLongLE(preUUIDReaderIndex + Long.BYTES, loginUUID.getLeastSignificantBits());
++            } else if (msb == loginUUID.getMostSignificantBits()
++                    && lsb == loginUUID.getLeastSignificantBits()) {
++                packet.setLongLE(preUUIDReaderIndex, playerUUID.getMostSignificantBits());
++                packet.setLongLE(preUUIDReaderIndex + Long.BYTES, playerUUID.getLeastSignificantBits());
++            }
++        };
 +        switch (DefinedPacket.readVarInt(packet)) {
 +            case 0x3F: { //PLAY_PLAYER_INFO
 +                final int type = packet.readUnsignedByte();
@@ -1182,13 +1451,10 @@ index 00000000..c439ecbb
 +                if (type == 0) { //ADD
 +                    for (int i = 0; i < num; i++) {
 +                        final int preUUIDReaderIndex = packet.readerIndex();
-+                        final long msb = packet.readLongLE();
-+                        final long lsb = packet.readLongLE();
-+                        if (deviceUUID != null && msb == playerUUID.getMostSignificantBits()
-+                                && lsb == playerUUID.getLeastSignificantBits()) {
-+                            packet.setLongLE(preUUIDReaderIndex, deviceUUID.getMostSignificantBits());
-+                            packet.setLongLE(preUUIDReaderIndex + Long.BYTES, deviceUUID.getLeastSignificantBits());
-+                        }
++                        add.accept(new UUID(packet.readLongLE(), packet.readLongLE()));
++                        packet.readerIndex(preUUIDReaderIndex);
++                        
++                        rewrite.run();
 +                        DefinedPacket.readSVarLong(packet); //entity id
 +                        packet.skipBytes(DefinedPacket.readVarInt(packet)); //username
 +                        packet.skipBytes(DefinedPacket.readVarInt(packet)); //skin name
@@ -1198,7 +1464,6 @@ index 00000000..c439ecbb
 +                        packet.skipBytes(DefinedPacket.readVarInt(packet)); //geom data
 +                        packet.skipBytes(DefinedPacket.readVarInt(packet)); //xuid
 +                        packet.skipBytes(DefinedPacket.readVarInt(packet)); //channel
-+                        add.accept(new UUID(msb, lsb));
 +                    }
 +                } else if (type == 1) { //REMOVE
 +                    for (int i = 0; i < num; i++) {
@@ -1207,6 +1472,10 @@ index 00000000..c439ecbb
 +                        remove.accept(new UUID(msb, lsb));
 +                    }
 +                }
++                break;
++            }
++            case 0x5D: { //PLAY_PLAYER_SKIN_PACKET
++                rewrite.run();
 +                break;
 +            }
 +            default: // NOOP
@@ -1226,7 +1495,7 @@ index 00000000..c439ecbb
 +    };
 +
 +    static public final Rewrite SK_SVARINT = (from, to, oldId, newId) ->
-+        DefinedPacket.writeSVarInt(DefinedPacket.readSVarInt(from), to);
++            DefinedPacket.writeSVarInt(DefinedPacket.readSVarInt(from), to);
 +
 +    static public final Rewrite SK_VARINT = (from, to, oldId, newId) ->
 +            DefinedPacket.writeVarInt(DefinedPacket.readVarInt(from), to);
@@ -1244,10 +1513,10 @@ index 00000000..c439ecbb
 +}
 diff --git a/proxy/src/main/java/network/ycc/waterdog/pe/PEBlockPalette.java b/proxy/src/main/java/network/ycc/waterdog/pe/PEBlockPalette.java
 new file mode 100644
-index 00000000..1ae4a6de
+index 00000000..0037f220
 --- /dev/null
 +++ b/proxy/src/main/java/network/ycc/waterdog/pe/PEBlockPalette.java
-@@ -0,0 +1,165 @@
+@@ -0,0 +1,161 @@
 +package network.ycc.waterdog.pe;
 +
 +import com.google.common.collect.MapMaker;
@@ -1324,6 +1593,9 @@ index 00000000..1ae4a6de
 +    Short2ObjectMap<BlockPair> idToEntry = new Short2ObjectLinkedOpenHashMap<>();
 +
 +    public PEBlockRewrite createRewrite(PEBlockPalette to) {
++        if (PEBlockPalette.this == to || uuid.equals(to.uuid)) {
++            return PEBlockRewrite.EMPTY;
++        }
 +        return new PEBlockRewrite() {
 +            public int map(int id) {
 +                return to.getId(getEntry(id));
@@ -1334,22 +1606,15 @@ index 00000000..1ae4a6de
 +    PEBlockPalette(ByteBuf buf, int version, UUID uuid) {
 +        this.uuid = uuid;
 +
-+        if (version >= ProtocolConstants.MINECRAFT_PE_1_12) {
-+            while (buf.isReadable()) {
-+                final String name = DefinedPacket.readString(buf);
-+                final short data = buf.readShortLE();
-+                final short id = buf.readShortLE();
-+
-+                addEntry(id, name, data);
++        int id = 0;
++        while (buf.isReadable()) {
++            final String name = DefinedPacket.readString(buf);
++            final short data = buf.readShortLE();
++            if (version >= ProtocolConstants.MINECRAFT_PE_1_12) {
++                buf.readShortLE(); //what does this id do?
 +            }
-+        } else {
-+            int id = 0;
-+            while (buf.isReadable()) {
-+                final String name = DefinedPacket.readString(buf);
-+                final short data = buf.readShortLE();
 +
-+                addEntry((short) id++, name, data);
-+            }
++            addEntry((short) id++, name, data);
 +        }
 +    }
 +
@@ -1415,95 +1680,231 @@ index 00000000..1ae4a6de
 +
 diff --git a/proxy/src/main/java/network/ycc/waterdog/pe/PECompressor.java b/proxy/src/main/java/network/ycc/waterdog/pe/PECompressor.java
 new file mode 100644
-index 00000000..86034cb3
+index 00000000..72ea99eb
 --- /dev/null
 +++ b/proxy/src/main/java/network/ycc/waterdog/pe/PECompressor.java
-@@ -0,0 +1,94 @@
+@@ -0,0 +1,230 @@
 +package network.ycc.waterdog.pe;
 +
-+import com.google.common.base.Preconditions;
++import static network.ycc.waterdog.pe.PENativeExt.CHUNK_FLOOR;
++import static network.ycc.waterdog.pe.PENativeExt.CHUNK_SIZE;
 +
 +import io.netty.buffer.ByteBuf;
++import io.netty.buffer.ByteBufAllocator;
++import io.netty.buffer.CompositeByteBuf;
 +import io.netty.channel.ChannelFutureListener;
 +import io.netty.channel.ChannelHandlerContext;
 +import io.netty.channel.ChannelOutboundHandlerAdapter;
 +import io.netty.channel.ChannelPromise;
++import io.netty.channel.unix.Buffer;
 +import io.netty.util.ReferenceCountUtil;
 +
 +import net.md_5.bungee.compress.CompressFactory;
 +import net.md_5.bungee.jni.zlib.BungeeZlib;
++import net.md_5.bungee.jni.zlib.NativeZlib;
 +import net.md_5.bungee.protocol.DefinedPacket;
 +
 +import network.ycc.raknet.RakNet;
 +import network.ycc.raknet.pipeline.FlushTickHandler;
 +import network.ycc.waterdog.api.metrics.RakNetMetrics;
 +
++import java.nio.ByteBuffer;
 +import java.util.function.BiConsumer;
 +import java.util.zip.DataFormatException;
-+import java.util.zip.Deflater;
 +
 +public class PECompressor extends ChannelOutboundHandlerAdapter {
 +
 +    public static final String NAME = "compress";
-+    protected static final int MAX_POOL_BYTES = 16 * 1024;
++
++    protected static final int MAX_POOL_BYTES = 128 * 1024;
++    protected static final int MAX_COMPONENTS = 512;
 +
 +    protected final BungeeZlib zlib = CompressFactory.zlib.newInstance();
-+    protected ByteBuf stashBuffer;
++    protected boolean dirty = false;
++    protected CompositeByteBuf outBuffer, inBuffer;
++    protected ByteBuf headerTmp, outTmp, inTmp;
 +
 +    @Override
 +    public void handlerAdded(ChannelHandlerContext ctx) {
-+        zlib.init( true, Deflater.DEFAULT_COMPRESSION );
-+        stashBuffer = ctx.alloc().directBuffer(MAX_POOL_BYTES);
++        //4 is fastest without the big dropoff in compression
++        zlib.init( true, 4 );
++        outBuffer = ctx.alloc().compositeDirectBuffer(MAX_COMPONENTS);
++        inBuffer = ctx.alloc().compositeDirectBuffer(MAX_COMPONENTS);
++        headerTmp = ctx.alloc().directBuffer(8, 8);
++        outTmp = ctx.alloc().directBuffer(CHUNK_SIZE, CHUNK_SIZE);
++        inTmp = ctx.alloc().directBuffer(CHUNK_SIZE, CHUNK_SIZE);
 +    }
 +
 +    @Override
 +    public void handlerRemoved(ChannelHandlerContext ctx) {
 +        zlib.free();
-+        ReferenceCountUtil.safeRelease(stashBuffer);
++        ReferenceCountUtil.safeRelease(outBuffer);
++        ReferenceCountUtil.safeRelease(inBuffer);
++        ReferenceCountUtil.safeRelease(headerTmp);
++        ReferenceCountUtil.safeRelease(outTmp);
++        ReferenceCountUtil.safeRelease(inTmp);
 +    }
 +
 +    @Override
 +    public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
 +        if (msg instanceof ByteBuf) {
 +            final ByteBuf buf = (ByteBuf) msg;
-+            if (!buf.isReadable()) {
-+                buf.release();
-+                promise.trySuccess();
-+                return;
-+            }
 +            try {
-+                DefinedPacket.writeVarInt(buf.readableBytes(), stashBuffer);
-+                stashBuffer.writeBytes(buf);
++                promise.trySuccess();
++                if (!buf.isReadable()) {
++                    return;
++                }
++                if (inBuffer.readableBytes() > MAX_POOL_BYTES) {
++                    flushData(ctx);
++                }
++                metricsIncrement(ctx, 4 + buf.readableBytes(), RakNetMetrics::preCompressionBytes);
++                if (zlib instanceof NativeZlib) {
++                    if (buf.readableBytes() >= (inTmp.writableBytes() - 5)) {
++                        //big packets are fine to encode per packet
++                        flushInTmp(ctx);
++                        DefinedPacket.writeVarInt(buf.readableBytes(), headerTmp.clear());
++                        nativeDeflatePacket(headerTmp, ctx.alloc());
++                        nativeDeflatePacket(buf, ctx.alloc());
++                    } else {
++                        //otherwise fill the aggregate buffer when possible, for performance
++                        DefinedPacket.writeVarInt(buf.readableBytes(), inTmp);
++                        inTmp.writeBytes(buf);
++                    }
++                } else {
++                    final ByteBuf header = ctx.alloc().directBuffer(8, 8);
++                    DefinedPacket.writeVarInt(buf.readableBytes(), header);
++                    inBuffer.addComponent(true, header);
++                    inBuffer.addComponent(true, buf.retain());
++                }
++                dirty = true;
++                if (outBuffer.readableBytes() > MAX_POOL_BYTES) {
++                    flushData(ctx);
++                }
++                metricsIncrement(ctx, 1, RakNetMetrics::preCompressionPacket);
++                FlushTickHandler.checkFlushTick(ctx.channel());
 +            } finally {
-+                buf.release();
++                ReferenceCountUtil.safeRelease(msg);
 +            }
-+            if (stashBuffer.readableBytes() > MAX_POOL_BYTES) {
-+                flushData(ctx);
-+            }
-+            metricsIncrement(ctx, 1, RakNetMetrics::preCompressionPacket);
-+            promise.trySuccess();
-+            FlushTickHandler.checkFlushTick(ctx.channel());
-+            return;
++        } else {
++            ctx.write(msg, promise);
 +        }
-+        super.write(ctx, msg, promise);
 +    }
 +
 +    @Override
 +    public void flush(ChannelHandlerContext ctx) throws Exception {
-+        if (stashBuffer.readableBytes() > 0) {
++        if (dirty) {
 +            flushData(ctx);
 +        }
-+        super.flush(ctx);
++        ctx.flush();
++    }
++
++    protected void flushInTmp(ChannelHandlerContext ctx) {
++        nativeDeflatePacket(inTmp, ctx.alloc());
++        inTmp.clear();
++    }
++
++    protected void nativeDeflatePacket(ByteBuf in, ByteBufAllocator alloc) {
++        if (!in.isReadable()) {
++            return;
++        } else if (in.hasMemoryAddress()) {
++            nativeDeflatePacketSingle(in, alloc);
++        } else {
++            nativeDeflatePacketComposite(in, alloc);
++        }
++    }
++
++    protected void nativeDeflatePacketSingle(ByteBuf in, ByteBufAllocator alloc) {
++        final NativeZlib nzl = (NativeZlib) zlib;
++
++        while (in.isReadable()) {
++            checkOutBufferFloor(alloc);
++
++            final int processed = nzl.processEx(
++                    in.memoryAddress() + in.readerIndex(), in.readableBytes(),
++                    outTmp.memoryAddress() + outTmp.writerIndex(), outTmp.writableBytes());
++
++            outTmp.writerIndex(outTmp.writerIndex() + processed);
++            in.readerIndex(in.readerIndex() + nzl.getConsumed());
++        }
++    }
++
++    protected void nativeDeflatePacketComposite(ByteBuf in, ByteBufAllocator alloc) {
++        final NativeZlib nzl = (NativeZlib) zlib;
++        final ByteBuffer[] buffers = in.nioBuffers();
++        int bufferIndex = 0;
++
++        while (bufferIndex != buffers.length) {
++            checkOutBufferFloor(alloc);
++
++            final ByteBuffer inChunk = buffers[bufferIndex];
++            final int processed = nzl.processEx(
++                    Buffer.memoryAddress(inChunk) + inChunk.position(), inChunk.remaining(),
++                    outTmp.memoryAddress() + outTmp.writerIndex(), outTmp.writableBytes());
++
++            outTmp.writerIndex(outTmp.writerIndex() + processed);
++            inChunk.position(inChunk.position() + nzl.getConsumed());
++
++            if (!inChunk.hasRemaining()) {
++                bufferIndex++;
++            }
++        }
++
++        in.readerIndex(in.readerIndex() + in.readableBytes());
++    }
++
++    protected void nativeDeflateFinish(ByteBufAllocator alloc) {
++        final NativeZlib nzl = (NativeZlib) zlib;
++        while (!nzl.getFinished()) {
++            checkOutBufferFloor(alloc);
++
++            final int processed = nzl.processEx(
++                    0, 0,
++                    outTmp.memoryAddress() + outTmp.writerIndex(), outTmp.writableBytes());
++
++            outTmp.writerIndex(outTmp.writerIndex() + processed);
++        }
++
++        if (outTmp.isReadable()) {
++            outBuffer.addComponent(true, outTmp);
++            outTmp = alloc.directBuffer(CHUNK_SIZE, CHUNK_SIZE);
++        }
++
++        nzl.doReset();
++    }
++
++    protected void checkOutBufferFloor(ByteBufAllocator alloc) {
++        if (outTmp.writableBytes() < CHUNK_FLOOR) {
++            outBuffer.addComponent(true, outTmp);
++            outTmp = alloc.directBuffer(CHUNK_SIZE, CHUNK_SIZE);
++        }
++    }
++
++    protected void flushDataNative(ChannelHandlerContext ctx) {
++        nativeDeflateFinish(ctx.alloc());
++        final ByteBuf out = outBuffer;
++        outBuffer = ctx.alloc().compositeDirectBuffer(MAX_COMPONENTS);
++        metricsIncrement(ctx, out.readableBytes(), RakNetMetrics::postCompressionBytes);
++        ctx.write(out).addListener(ChannelFutureListener.FIRE_EXCEPTION_ON_FAILURE);
++    }
++
++    protected void flushDataNonNative(ChannelHandlerContext ctx) throws DataFormatException {
++        final ByteBuf out = ctx.alloc().directBuffer(inBuffer.readableBytes() / 4 + 16);
++        metricsIncrement(ctx, inBuffer.readableBytes(), RakNetMetrics::preCompressionBytes);
++        zlib.process(inBuffer, out);
++        inBuffer.release();
++        inBuffer = ctx.alloc().compositeDirectBuffer(MAX_COMPONENTS);
++        metricsIncrement(ctx, out.readableBytes(), RakNetMetrics::postCompressionBytes);
++        ctx.write(out).addListener(ChannelFutureListener.FIRE_EXCEPTION_ON_FAILURE);
 +    }
 +
 +    protected void flushData(ChannelHandlerContext ctx) throws DataFormatException {
-+        final ByteBuf out = ctx.alloc().directBuffer(128);
-+        Preconditions.checkArgument(stashBuffer.hasMemoryAddress(), "pre-compression buffer is not direct");
-+        metricsIncrement(ctx, stashBuffer.readableBytes(), RakNetMetrics::preCompressionBytes);
-+        zlib.process(stashBuffer, out);
-+        metricsIncrement(ctx, out.readableBytes(), RakNetMetrics::postCompressionBytes);
-+        stashBuffer.clear();
-+        ctx.write(out).addListener(ChannelFutureListener.FIRE_EXCEPTION_ON_FAILURE);
++        dirty = false;
++        if (zlib instanceof NativeZlib) {
++            flushInTmp(ctx);
++            flushDataNative(ctx);
++        } else {
++            flushDataNonNative(ctx);
++        }
 +    }
 +
 +    protected void metricsIncrement(ChannelHandlerContext ctx, int i, BiConsumer<RakNetMetrics, Integer> consumer) {
@@ -1515,19 +1916,18 @@ index 00000000..86034cb3
 +}
 diff --git a/proxy/src/main/java/network/ycc/waterdog/pe/PEDecompressor.java b/proxy/src/main/java/network/ycc/waterdog/pe/PEDecompressor.java
 new file mode 100644
-index 00000000..5d785901
+index 00000000..e6f50f44
 --- /dev/null
 +++ b/proxy/src/main/java/network/ycc/waterdog/pe/PEDecompressor.java
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,39 @@
 +package network.ycc.waterdog.pe;
-+
-+import com.google.common.base.Preconditions;
 +
 +import io.netty.buffer.ByteBuf;
 +import io.netty.channel.ChannelHandlerContext;
 +import io.netty.util.ReferenceCountUtil;
 +
 +import net.md_5.bungee.compress.PacketDecompressor;
++import net.md_5.bungee.jni.zlib.NativeZlib;
 +import net.md_5.bungee.protocol.DefinedPacket;
 +
 +import java.util.List;
@@ -1541,25 +1941,27 @@ index 00000000..5d785901
 +    }
 +
 +    @Override
-+    protected void decode(ChannelHandlerContext ctx, ByteBuf buf, List<Object> list) throws Exception {
-+        buf = PEEncryptionUtils.makeDirectOrRetain(ctx.alloc(), buf);
-+        final ByteBuf data = ctx.alloc().ioBuffer(32);
++    protected void decode(ChannelHandlerContext ctx, ByteBuf buf, List<Object> out) throws Exception {
++        ByteBuf data = null;
 +        try {
-+            getZlib().process(buf, data);
-+            while (data.isReadable()) {
-+                list.add(data.readRetainedSlice(DefinedPacket.readVarInt(data)));
++            if (getZlib() instanceof NativeZlib) {
++                data = PENativeExt.inflateZlibComposite((NativeZlib) getZlib(), buf, ctx.alloc());
++            } else {
++                data = ctx.alloc().ioBuffer(buf.readableBytes() * 4);
++                getZlib().process(buf, data);
 +            }
-+            Preconditions.checkArgument(!data.isReadable(), "Compressed data not handled");
++            while (data.isReadable()) {
++                out.add(data.readRetainedSlice(DefinedPacket.readVarInt(data)));
++            }
 +        } finally {
 +            ReferenceCountUtil.safeRelease(data);
-+            ReferenceCountUtil.safeRelease(buf);
 +        }
 +    }
 +
 +}
 diff --git a/proxy/src/main/java/network/ycc/waterdog/pe/PEDimSwitchLock.java b/proxy/src/main/java/network/ycc/waterdog/pe/PEDimSwitchLock.java
 new file mode 100644
-index 00000000..4f0057ee
+index 00000000..4f50e2e3
 --- /dev/null
 +++ b/proxy/src/main/java/network/ycc/waterdog/pe/PEDimSwitchLock.java
 @@ -0,0 +1,103 @@
@@ -1586,7 +1988,7 @@ index 00000000..4f0057ee
 +
 +    public static final String NAME = "peproxy-dimlock";
 +
-+    protected static int MAX_QUEUE_SIZE = 4096;
++    protected static int MAX_QUEUE_SIZE = 8192;
 +    protected static int DIM_ACK_TIMEOUT_MILLIS = 15000;
 +
 +    protected final Queue<ByteBuf> queue = new ArrayDeque<>(32);
@@ -1668,46 +2070,74 @@ index 00000000..4f0057ee
 +}
 diff --git a/proxy/src/main/java/network/ycc/waterdog/pe/PEEncryptionInitializer.java b/proxy/src/main/java/network/ycc/waterdog/pe/PEEncryptionInitializer.java
 new file mode 100644
-index 00000000..0b21c9f1
+index 00000000..366103e9
 --- /dev/null
 +++ b/proxy/src/main/java/network/ycc/waterdog/pe/PEEncryptionInitializer.java
-@@ -0,0 +1,110 @@
+@@ -0,0 +1,210 @@
 +package network.ycc.waterdog.pe;
++
++import com.google.gson.JsonObject;
 +
 +import com.nimbusds.jose.JWSObject;
 +
 +import io.netty.buffer.ByteBuf;
-+import io.netty.buffer.Unpooled;
++import io.netty.buffer.ByteBufAllocator;
++import io.netty.buffer.CompositeByteBuf;
 +import io.netty.channel.Channel;
 +import io.netty.channel.ChannelHandlerContext;
++import io.netty.channel.ChannelInboundHandlerAdapter;
 +import io.netty.channel.ChannelInitializer;
-+
++import io.netty.channel.ChannelOutboundHandlerAdapter;
++import io.netty.channel.ChannelPromise;
++import io.netty.handler.codec.DecoderException;
 +import io.netty.util.ReferenceCountUtil;
-+import lombok.RequiredArgsConstructor;
++
++import lombok.Getter;
 +
 +import net.md_5.bungee.EncryptionUtil;
 +import net.md_5.bungee.jni.cipher.BungeeCipher;
++import net.md_5.bungee.jni.cipher.NativeCipher;
 +import net.md_5.bungee.netty.PipelineUtils;
-+import net.md_5.bungee.netty.cipher.CipherDecoder;
-+import net.md_5.bungee.netty.cipher.CipherEncoder;
 +
-+import network.ycc.waterdog.pe.packet.PEHandshake;
 +import network.ycc.waterdog.pe.packet.PEEncryptionRequest;
 +
 +import javax.crypto.KeyAgreement;
 +import javax.crypto.spec.SecretKeySpec;
 +
-+import java.security.MessageDigest;
-+import java.security.NoSuchAlgorithmException;
-+import java.security.PublicKey;
++import java.security.*;
++import java.security.spec.InvalidKeySpecException;
++import java.text.ParseException;
 +import java.util.Base64;
-+import java.util.List;
 +
-+@RequiredArgsConstructor
 +public class PEEncryptionInitializer extends ChannelInitializer<Channel> {
-+    private final PEEncryptionRequest request;
++    public static final int HASH_LENGTH = 8;
++    private static final SecureRandom numberGenerator = new SecureRandom();
 +
-+    protected void initChannel(Channel ch) throws Exception {
++    @Getter
++    private final PEEncryptionRequest request;
++    private final byte[] keyBytes;
++    private final SecretKeySpec serverKey;
++    private ByteBuf hashBuffer;
++    private ByteBuf keyBuffer;
++    private int hashBufferReader;
++
++    public PEEncryptionInitializer(PublicKey publicKey) throws NoSuchAlgorithmException, InvalidKeyException {
++        final MessageDigest digest = MessageDigest.getInstance("SHA-256");
++        final JsonObject additionalData = new JsonObject();
++        final String saltString = createSalt();
++        final KeyAgreement ka = KeyAgreement.getInstance("ECDH");
++        ka.init(PEEncryptionUtils.getKeyPair().getPrivate());
++        ka.doPhase(publicKey, true);
++        digest.update(Base64.getDecoder().decode(saltString));
++        digest.update(ka.generateSecret());
++        additionalData.addProperty("salt", saltString);
++        keyBytes = digest.digest();
++        serverKey = new SecretKeySpec(keyBytes, "AES");
++        request = new PEEncryptionRequest(PEEncryptionUtils.encodeJWT(additionalData));
++    }
++
++    public PEEncryptionInitializer(PEEncryptionRequest request) throws NoSuchAlgorithmException, ParseException,
++            InvalidKeySpecException, InvalidKeyException {
 +        final MessageDigest digest = MessageDigest.getInstance("SHA-256");
 +        final JWSObject additionalData = JWSObject.parse(request.getJwtData());
 +        final PublicKey publicKey = PEEncryptionUtils.parseKey(additionalData.getHeader().getX509CertURL().toString());
@@ -1717,77 +2147,149 @@ index 00000000..0b21c9f1
 +        ka.doPhase(publicKey, true);
 +        digest.update(Base64.getDecoder().decode(saltString));
 +        digest.update(ka.generateSecret());
-+        final byte[] keyBytes = digest.digest();
-+        final SecretKeySpec serverKey = new SecretKeySpec(keyBytes, "AES");
++        keyBytes = digest.digest();
++        serverKey = new SecretKeySpec(keyBytes, "AES");
++        this.request = request;
++    }
++
++    protected static String createSalt() {
++        final byte[] out = new byte[32];
++        numberGenerator.nextBytes(out);
++        return Base64.getEncoder().encodeToString(out);
++    }
++
++    protected void initChannel(Channel ch) throws Exception {
++        hashBuffer = ch.alloc().directBuffer(32, 32);
++        keyBuffer = ch.alloc().directBuffer(32, 32).writeBytes(keyBytes);
++        hashBufferReader = hashBuffer.readerIndex();
++
 +        ch.pipeline().addBefore(PEDecompressor.NAME, PipelineUtils.DECRYPT_HANDLER,
-+                new PECipherDecoder(EncryptionUtil.getCipher(false, serverKey)));
++                new PECipherDecoder());
 +        ch.pipeline().addBefore(PECompressor.NAME, PipelineUtils.ENCRYPT_HANDLER,
-+                new PECipherEncoder(EncryptionUtil.getCipher(true, serverKey), keyBytes));
++                new PECipherEncoder());
 +    }
 +
-+    static class PECipherDecoder extends CipherDecoder {
-+        public PECipherDecoder(BungeeCipher cipher) {
-+            super(cipher);
-+        }
-+
-+        @Override
-+        protected void decode(ChannelHandlerContext ctx, ByteBuf msg, List<Object> out) throws Exception {
-+            msg = PEEncryptionUtils.makeDirectOrRetain(ctx.alloc(), msg);
-+            try {
-+                super.decode(ctx, msg, out);
-+                final ByteBuf data = (ByteBuf) out.get(0);
-+                data.writerIndex(data.writerIndex() - 8); //ignore hash
-+            } finally {
-+                msg.release();
-+            }
-+        }
++    protected void destroy() {
++        hashBuffer.release();
++        keyBuffer.release();
 +    }
 +
-+    static class PECipherEncoder extends CipherEncoder {
-+        private final byte[] keyBytes;
-+        private final MessageDigest digest;
++    protected class PECipherDecoder extends ChannelInboundHandlerAdapter {
 +        private long counter = 0;
++        private final BungeeCipher cipher;
 +
-+        public PECipherEncoder(BungeeCipher cipher, byte[] keyBytes) throws NoSuchAlgorithmException {
-+            super(cipher);
-+            this.keyBytes = keyBytes;
-+            this.digest = MessageDigest.getInstance("SHA-256");
++        public PECipherDecoder() throws GeneralSecurityException {
++            cipher = EncryptionUtil.getCipher(false, serverKey);
 +        }
 +
 +        @Override
-+        protected void encode(ChannelHandlerContext ctx, ByteBuf in, ByteBuf out) throws Exception {
-+            in = PEEncryptionUtils.makeDirectOrRetain(ctx.alloc(), in);
-+            try {
-+                appendHash(in);
-+                super.encode(ctx, in, out);
-+            } finally {
-+                in.release();
++        public void handlerRemoved(ChannelHandlerContext ctx) {
++            cipher.free();
++            destroy();
++        }
++
++        @Override
++        public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
++            if (msg instanceof ByteBuf) {
++                //TODO: chunked in-place cipher seems to break, maybe not the hash?
++                final ByteBuf data = condenseMaybe((ByteBuf) msg, ctx.alloc());
++                //final ByteBuf data = (ByteBuf) msg;
++                try {
++                    final int readerIndex = data.readerIndex();
++                    final int writerIndex = data.writerIndex();
++                    PENativeExt.cipherInPlace(cipher, data);
++                    createHash(cipher, data.readerIndex(readerIndex).writerIndex(writerIndex - HASH_LENGTH), counter++);
++                    data.writerIndex(writerIndex);
++                    while (hashBuffer.isReadable()) {
++                        if (data.readByte() != hashBuffer.readByte()) {
++                            throw new DecoderException("Corrupt encrypted data!");
++                        }
++                    }
++                    data.readerIndex(readerIndex).writerIndex(writerIndex - HASH_LENGTH);
++                    ctx.fireChannelRead(data.retain());
++                } finally {
++                    ReferenceCountUtil.safeRelease(data);
++                }
++            } else {
++                ctx.fireChannelRead(msg);
 +            }
 +        }
 +
-+        void appendHash(ByteBuf data) {
-+            final ByteBuf counterBytes = Unpooled.buffer(8, 8).writeLongLE(counter++);
-+            final int maxReader = data.readerIndex() + data.readableBytes();
-+            while (counterBytes.isReadable()) {
-+                digest.update(counterBytes.readByte());
++        protected ByteBuf condenseMaybe(ByteBuf buf, ByteBufAllocator alloc) {
++            if (buf.nioBufferCount() > 1) {
++                final ByteBuf out = alloc.directBuffer(buf.readableBytes());
++                out.writeBytes(buf);
++                buf.release();
++                return out;
++            } else {
++                return buf;
 +            }
-+            for (int i = data.readerIndex() ; i < maxReader ; i++) {
-+                digest.update(data.getByte(i));
-+            }
-+            for (byte b : keyBytes) {
-+                digest.update(b);
-+            }
-+            data.writeBytes(digest.digest(), 0, 8);
-+            digest.reset();
 +        }
++    }
++
++    protected class PECipherEncoder extends ChannelOutboundHandlerAdapter {
++        private long counter = 0;
++        private final BungeeCipher cipher;
++
++        public PECipherEncoder() throws GeneralSecurityException {
++            cipher = EncryptionUtil.getCipher(true, serverKey);
++        }
++
++        @Override
++        public void handlerRemoved(ChannelHandlerContext ctx) {
++            cipher.free();
++        }
++
++        @Override
++        public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
++            if (msg instanceof ByteBuf) {
++                final ByteBuf data = (ByteBuf) msg;
++                final CompositeByteBuf out = ctx.alloc().compositeDirectBuffer(2);
++                final ByteBuf hashChunk = ctx.alloc().directBuffer(32, 32);
++                try {
++                    final int readerIndex = data.readerIndex();
++                    createHash(cipher, data, counter++, hashChunk);
++                    data.readerIndex(readerIndex);
++                    PENativeExt.cipherInPlace(cipher, data);
++                    PENativeExt.cipherInPlace(cipher, hashChunk);
++                    out.addComponent(true, data.retain());
++                    out.addComponent(true, hashChunk.retain());
++                    ctx.write(out.retain(), promise);
++                } finally {
++                    ReferenceCountUtil.safeRelease(msg);
++                    ReferenceCountUtil.safeRelease(out);
++                    ReferenceCountUtil.safeRelease(hashChunk);
++                }
++            } else {
++                ctx.write(msg, promise);
++            }
++        }
++    }
++
++    protected void createHash(BungeeCipher cipher, ByteBuf in, long counter) {
++        hashBuffer.readerIndex(hashBufferReader);
++        hashBuffer.writerIndex(hashBufferReader);
++
++        createHash(cipher, in, counter, hashBuffer);
++    }
++
++    protected void createHash(BungeeCipher cipher, ByteBuf in, long counter, ByteBuf out) {
++        final int readerIndex = out.readerIndex();
++        if (cipher instanceof NativeCipher) {
++            PENativeExt.staticPEHash((NativeCipher) cipher, counter, in, keyBuffer, out);
++        } else {
++            cipher.staticPEHash(counter, in, keyBuffer, out);
++        }
++
++        out.writerIndex(readerIndex + HASH_LENGTH); //need only the first 8 bytes
 +    }
 +}
 diff --git a/proxy/src/main/java/network/ycc/waterdog/pe/PEEncryptionUtils.java b/proxy/src/main/java/network/ycc/waterdog/pe/PEEncryptionUtils.java
 new file mode 100644
-index 00000000..369f5aeb
+index 00000000..27adebeb
 --- /dev/null
 +++ b/proxy/src/main/java/network/ycc/waterdog/pe/PEEncryptionUtils.java
-@@ -0,0 +1,291 @@
+@@ -0,0 +1,296 @@
 +package network.ycc.waterdog.pe;
 +
 +import com.google.common.base.Charsets;
@@ -1810,12 +2312,12 @@ index 00000000..369f5aeb
 +import com.nimbusds.jose.jwk.Curve;
 +
 +import io.netty.buffer.ByteBuf;
-+import io.netty.buffer.ByteBufAllocator;
 +import io.netty.buffer.ByteBufInputStream;
 +import io.netty.buffer.Unpooled;
 +import io.netty.handler.codec.DecoderException;
 +import io.netty.handler.codec.EncoderException;
 +
++import net.md_5.bungee.BungeeCord;
 +import net.md_5.bungee.protocol.DefinedPacket;
 +import net.md_5.bungee.protocol.ProtocolConstants;
 +
@@ -1828,7 +2330,6 @@ index 00000000..369f5aeb
 +import java.math.BigInteger;
 +import java.net.URI;
 +import java.nio.charset.StandardCharsets;
-+import java.security.Key;
 +import java.security.KeyFactory;
 +import java.security.KeyPair;
 +import java.security.KeyPairGenerator;
@@ -1848,13 +2349,14 @@ index 00000000..369f5aeb
 +    public static final String MOJANG_KEY = "MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAE8ELkixyLcwlZryUQcu1TvPOmI2B7vX83ndnWRUaXm74wFfa5f/lwQNTfrLVHa2PmenpGI6JhIMUJaWZrjmMj90NoKNFSNBuKdm8rYiXsfaz3K36x/1U26HpG0ZxK/V1V";
 +
 +    static final Gson GSON;
-+    static final DefaultJWSVerifierFactory jwsverifierfactory;
++    static final DefaultJWSVerifierFactory jwsVerifierFactory;
 +    static final KeyPair keyPair;
 +    static final KeyFactory keyfactory;
++    static final PublicKey mojangPublicKey;
 +
 +    static {
 +        GSON = new GsonBuilder().setPrettyPrinting().create();
-+        jwsverifierfactory = new DefaultJWSVerifierFactory();
++        jwsVerifierFactory = new DefaultJWSVerifierFactory();
 +        try {
 +            KeyPairGenerator gen = KeyPairGenerator.getInstance("EC");
 +            gen.initialize(Curve.P_384.toECParameterSpec());
@@ -1867,6 +2369,11 @@ index 00000000..369f5aeb
 +        } catch (NoSuchAlgorithmException e) {
 +            throw new RuntimeException("Unable to init key factory", e);
 +        }
++        try {
++            mojangPublicKey = parseKey(MOJANG_KEY);
++        } catch (InvalidKeySpecException e) {
++            throw new RuntimeException("Unable to init mojang key", e);
++        }
 +    }
 +
 +    public static void parseHandshake(PEHandshake handshake) {
@@ -1875,11 +2382,11 @@ index 00000000..369f5aeb
 +        final ByteBuf loginData = buf.readSlice(DefinedPacket.readVarInt(buf));
 +        final ByteBuf chainDataBytes = loginData.readSlice(loginData.readIntLE());
 +        final ByteBuf jwsDataBytes = loginData.readSlice(loginData.readIntLE());
-+        final Pair<Key, JsonObject> chainData = extractChainData(GSON.fromJson(
++        final Pair<PublicKey, JsonObject> chainData = extractChainData(GSON.fromJson(
 +                new InputStreamReader(new ByteBufInputStream(chainDataBytes)),
 +                new TypeToken<Map<String, List<String>>>() {}.getType()
 +        ));
-+        final Key key = chainData.getLeft();
++        final PublicKey key = chainData.getLeft();
 +        final JsonObject identityData = chainData.getRight();
 +        final String jwsString = jwsDataBytes.readCharSequence(jwsDataBytes.readableBytes(), Charsets.UTF_8).toString();
 +        final JWSObject additionalData;
@@ -1893,13 +2400,23 @@ index 00000000..369f5aeb
 +        Preconditions.checkArgument(serverAddr != null, "ServerAddress is missing");
 +        final String[] serverAddrSplit = serverAddr.split("[:]");
 +
++        clientInfo.addProperty("Waterdog_OriginalUUID", getString(identityData, "identity"));
++
 +        handshake.setClientInfo(clientInfo);
-+        handshake.setUsername(getString(identityData, "displayName").replaceAll(" ", "_")); //TODO: make configurable
++        handshake.setUsername(getString(identityData, "displayName"));
++        if (BungeeCord.getInstance().config.isReplaceUsernameSpaces()) {
++            handshake.setUsername(handshake.getUsername().replaceAll(" ", "_"));
++        }
 +        handshake.setUuid(UUID.fromString(getString(identityData, "identity")));
-+        handshake.setDeviceUUID(handshake.getUuid());
++        handshake.setLoginUUID(handshake.getUuid());
 +        handshake.setAuthorized(key != null);
 +        if (handshake.isAuthorized()) {
-+            handshake.setUuid(new UUID(0, new BigInteger(getString(identityData, "XUID")).longValue()));
++            handshake.setPublicKey(key);
++            handshake.setXuid(new BigInteger(getString(identityData, "XUID")));
++            if (BungeeCord.getInstance().config.isUseXUIDForUUID()) {
++                handshake.setUuid(new UUID(0, handshake.getXuid().longValue()));
++            }
++            Preconditions.checkArgument(handshake.getXuid().signum() == 1, "XUID is negative or zero");
 +        }
 +        handshake.setHost(serverAddrSplit[0]);
 +        if (serverAddrSplit.length > 1) {
@@ -1912,7 +2429,7 @@ index 00000000..369f5aeb
 +    public static void createHandshake(PEHandshake handshake) {
 +        final ByteBuf buf = Unpooled.buffer(512);
 +        final byte[] identityData = createIdentityData(handshake.getUsername(),
-+                handshake.getUuid()).getBytes(StandardCharsets.UTF_8);
++                handshake.getUuid(), handshake.getXuid()).getBytes(StandardCharsets.UTF_8);
 +        final byte[] clientData = createClientData(handshake.getClientInfo(),
 +                handshake.getHost(), handshake.getPort(), handshake.getUuid()).getBytes(StandardCharsets.UTF_8);
 +        buf.writeInt(handshake.getProtocolVersion() + ProtocolConstants.PE_PROTOCOL_OFFSET);
@@ -1925,23 +2442,14 @@ index 00000000..369f5aeb
 +        buf.readBytes(handshake.getHandshakeData());
 +    }
 +
-+    static public ByteBuf makeDirectOrRetain(ByteBufAllocator alloc, ByteBuf in) {
-+        if (in.hasMemoryAddress()) {
-+            return in.retain();
-+        }
-+        final ByteBuf out = alloc.directBuffer(in.readableBytes());
-+        out.writeBytes(in);
-+        return out;
-+    }
-+
 +    ////// READING
 +
-+    static Pair<Key, JsonObject> extractChainData(Map<String, List<String>> maindata) {
++    static Pair<PublicKey, JsonObject> extractChainData(Map<String, List<String>> maindata) {
 +        final List<String> chain = maindata.get("chain");
 +        try {
-+            PublicKey key = parseKey(MOJANG_KEY);
 +            boolean foundMojangKey = false;
 +            boolean signatureValid = false;
++            PublicKey key = mojangPublicKey;
 +            for (String element : chain) {
 +                final JWSObject jwsobject = JWSObject.parse(element);
 +                if (!foundMojangKey && jwsobject.getHeader().getX509CertURL().toString().equals(MOJANG_KEY)) {
@@ -2020,7 +2528,7 @@ index 00000000..369f5aeb
 +    }
 +
 +    static boolean verify(JWSObject object, PublicKey key) throws JOSEException {
-+        return object.verify(jwsverifierfactory.createJWSVerifier(object.getHeader(), key));
++        return object.verify(jwsVerifierFactory.createJWSVerifier(object.getHeader(), key));
 +    }
 +
 +    static public PublicKey parseKey(String key) throws InvalidKeySpecException {
@@ -2034,17 +2542,16 @@ index 00000000..369f5aeb
 +    }
 +
 +    @SuppressWarnings("serial")
-+    static String createIdentityData(String username, UUID uuid) {
++    static String createIdentityData(String username, UUID uuid, BigInteger xuid) {
 +        final Map<String, List<String>> chainmap = new HashMap<>();
 +        final long iat = System.currentTimeMillis() / 1000;
 +        final long exp = iat + 24 * 3600;
-+        JsonObject dataChain = new JsonObject();
-+        JsonObject extraData = new JsonObject();
++        final JsonObject extraData = new JsonObject();
++        final JsonObject dataChain = new JsonObject();
 +        extraData.addProperty("identity", uuid.toString());
 +        extraData.addProperty("displayName", username);
-+        extraData.addProperty("XUID", String.valueOf(uuid.getLeastSignificantBits()));
-+        //chain
-+        dataChain.addProperty("nbf", iat - 10);
++        extraData.addProperty("XUID", xuid == null ? "" : xuid.toString());
++        dataChain.addProperty("nbf", iat - 3600);
 +        dataChain.addProperty("exp", exp);
 +        dataChain.addProperty("iat", iat);
 +        dataChain.addProperty("iss", "self");
@@ -2058,7 +2565,7 @@ index 00000000..369f5aeb
 +
 +    static String encodeJWT(JsonObject payload) {
 +        try {
-+            JWSObject jwsobject = new JWSObject(
++            final JWSObject jwsobject = new JWSObject(
 +                    new JWSHeader.Builder(JWSAlgorithm.ES384)
 +                            .x509CertURL(new URI(Base64.getEncoder().encodeToString(keyPair.getPublic().getEncoded())))
 +                            .build(),
@@ -2072,28 +2579,136 @@ index 00000000..369f5aeb
 +    }
 +
 +    static String createClientData(JsonObject baseClientInfo, String host, int port, UUID uuid) {
-+        JsonObject out = new JsonObject();
++        final JsonObject out = new JsonObject();
 +        baseClientInfo.entrySet().forEach(entry -> out.add(entry.getKey(), entry.getValue()));
 +        out.addProperty("ServerAddress", host + ":" + port);
 +        out.addProperty("SelfSignedId", uuid.toString());
 +        return encodeJWT(out);
 +    }
 +}
-diff --git a/proxy/src/main/java/network/ycc/waterdog/pe/PEPipelineUtils.java b/proxy/src/main/java/network/ycc/waterdog/pe/PEPipelineUtils.java
+diff --git a/proxy/src/main/java/network/ycc/waterdog/pe/PENativeExt.java b/proxy/src/main/java/network/ycc/waterdog/pe/PENativeExt.java
 new file mode 100644
-index 00000000..5ef25093
+index 00000000..eddc3303
 --- /dev/null
-+++ b/proxy/src/main/java/network/ycc/waterdog/pe/PEPipelineUtils.java
-@@ -0,0 +1,88 @@
++++ b/proxy/src/main/java/network/ycc/waterdog/pe/PENativeExt.java
+@@ -0,0 +1,97 @@
 +package network.ycc.waterdog.pe;
 +
++import io.netty.buffer.ByteBuf;
++import io.netty.buffer.ByteBufAllocator;
++import io.netty.buffer.CompositeByteBuf;
++
++import io.netty.channel.unix.Buffer;
++
++import java.nio.ByteBuffer;
++import java.security.GeneralSecurityException;
++
++import net.md_5.bungee.jni.cipher.BungeeCipher;
++import net.md_5.bungee.jni.cipher.NativeCipher;
++import net.md_5.bungee.jni.zlib.NativeZlib;
++
++public class PENativeExt {
++    public static final int CHUNK_SIZE = 8192;
++    public static final int CHUNK_FLOOR = 512;
++
++    public static CompositeByteBuf inflateZlibComposite(NativeZlib nzl, ByteBuf in, ByteBufAllocator alloc) {
++        final CompositeByteBuf out = alloc.compositeDirectBuffer(128);
++        final ByteBuffer[] buffers = in.nioBuffers();
++        ByteBuf outChunk = alloc.directBuffer(CHUNK_SIZE, CHUNK_SIZE);
++        int bufferIndex = 0;
++
++        assert !nzl.isCompress();
++
++        while ( !nzl.getFinished() && bufferIndex != buffers.length )
++        {
++            if (outChunk.writableBytes() < CHUNK_FLOOR) {
++                out.addComponent(true, outChunk);
++                outChunk = alloc.directBuffer(CHUNK_SIZE, CHUNK_SIZE);
++            }
++
++            final ByteBuffer inChunk = buffers[Math.min(bufferIndex, buffers.length - 1)];
++
++            int processed = nzl.processEx(
++                    Buffer.memoryAddress(inChunk) + inChunk.position(), inChunk.remaining(),
++                    outChunk.memoryAddress() + outChunk.writerIndex(), outChunk.writableBytes());
++
++            inChunk.position(inChunk.position() + nzl.getConsumed());
++            outChunk.writerIndex(outChunk.writerIndex() + processed);
++
++            if (!inChunk.hasRemaining()) {
++                bufferIndex++;
++            }
++        }
++
++        if (outChunk.isReadable()) {
++            out.addComponent(true, outChunk);
++        } else {
++            outChunk.release();
++        }
++
++        nzl.doReset();
++
++        return out;
++    }
++
++    public static void staticPEHash(NativeCipher cipher, long counter, ByteBuf in, ByteBuf key, ByteBuf out) {
++        if (in.hasMemoryAddress()) {
++            cipher.staticPEHash(counter, in, key, out);
++        } else {
++            final ByteBuffer[] buffers = in.nioBuffers();
++            cipher.updateLongLE(counter);
++            for (ByteBuffer buffer : buffers) {
++                if (buffer.remaining() > 0) {
++                    cipher.updateUnsafe(Buffer.memoryAddress(buffer) + buffer.position(), buffer.remaining());
++                }
++            }
++            cipher.update(key.markReaderIndex());
++            key.resetReaderIndex();
++            cipher.digest(out);
++        }
++    }
++
++    public static void cipherInPlace(NativeCipher cipher, ByteBuf buf) {
++        if (buf.hasMemoryAddress()) {
++            cipher.cipherUnsafe(buf.memoryAddress() + buf.readerIndex(), buf.readableBytes());
++        } else {
++            final ByteBuffer[] buffers = buf.nioBuffers();
++            for (ByteBuffer buffer : buffers) {
++                if (buffer.remaining() > 0) {
++                    cipher.cipherUnsafe(Buffer.memoryAddress(buffer) + buffer.position(), buffer.remaining());
++                }
++            }
++        }
++    }
++
++    public static void cipherInPlace(BungeeCipher cipher, ByteBuf buf) throws GeneralSecurityException {
++        if (cipher instanceof NativeCipher) {
++            cipherInPlace((NativeCipher) cipher, buf);
++        } else {
++            cipher.cipher(buf.duplicate(), buf.duplicate().writerIndex(buf.readerIndex()));
++        }
++    }
++}
+diff --git a/proxy/src/main/java/network/ycc/waterdog/pe/PEPipelineUtils.java b/proxy/src/main/java/network/ycc/waterdog/pe/PEPipelineUtils.java
+new file mode 100644
+index 00000000..33f83cc2
+--- /dev/null
++++ b/proxy/src/main/java/network/ycc/waterdog/pe/PEPipelineUtils.java
+@@ -0,0 +1,125 @@
++package network.ycc.waterdog.pe;
++
++import io.netty.bootstrap.ServerBootstrap;
 +import io.netty.channel.Channel;
++import io.netty.channel.ChannelFutureListener;
 +import io.netty.channel.ChannelHandlerContext;
 +import io.netty.channel.ChannelInboundHandlerAdapter;
 +import io.netty.channel.ChannelInitializer;
 +
 +import io.netty.channel.ChannelPipeline;
++import io.netty.channel.WriteBufferWaterMark;
++import io.netty.channel.epoll.EpollDatagramChannel;
 +import io.netty.channel.socket.DatagramPacket;
++import io.netty.channel.unix.UnixChannelOption;
 +import io.netty.handler.timeout.ReadTimeoutHandler;
 +import io.netty.util.ReferenceCountUtil;
 +import lombok.RequiredArgsConstructor;
@@ -2105,15 +2720,27 @@ index 00000000..5ef25093
 +import net.md_5.bungee.protocol.ProtocolConstants;
 +import net.md_5.bungee.query.QueryHandler;
 +
++import network.ycc.raknet.pipeline.PongHandler;
 +import network.ycc.raknet.pipeline.UserDataCodec;
 +
 +import network.ycc.waterdog.api.event.UserChannelTapEvent;
 +
 +import java.util.concurrent.TimeUnit;
++import java.util.function.Supplier;
 +import java.util.logging.Level;
++import java.util.logging.Logger;
 +
 +public class PEPipelineUtils {
 +    public static final UserDataCodec MC_USER_DATA_CODEC = new UserDataCodec(0xFE);
++
++    private static final int SERVER_LOW_MARK = Integer.getInteger(
++            "network.ycc.waterdog.server_low_mark",   5 * 1024 * 1024 ); // 5 mb
++    private static final int SERVER_HIGH_MARK = Integer.getInteger(
++            "network.ycc.waterdog.server_high_mark", 10 * 1024 * 1024 ); // 10 mb
++    private static final WriteBufferWaterMark SERVER_MARK = new WriteBufferWaterMark( SERVER_LOW_MARK, SERVER_HIGH_MARK );
++
++    private static final int REUSE_LISTENERS = Integer.getInteger(
++            "network.ycc.waterdog.reuse_listeners", Runtime.getRuntime().availableProcessors());
 +
 +    public static final ChannelInitializer<Channel> SERVER_CHILD = new ChannelInitializer<Channel>() {
 +        protected void initChannel(Channel channel) {
@@ -2127,7 +2754,8 @@ index 00000000..5ef25093
 +                @Override
 +                public void channelRead(ChannelHandlerContext ctx, Object msg) {
 +                    if (msg instanceof network.ycc.raknet.packet.Packet) {
-+                        BungeeCord.getInstance().getLogger().log(Level.FINER, "Stray raknet packet sent to a child channel handler");
++                        BungeeCord.getInstance().getLogger().log(Level.FINER,
++                                "Stray RakNet packet sent to a child channel handler");
 +                        ReferenceCountUtil.safeRelease(msg);
 +                        return;
 +                    }
@@ -2135,17 +2763,35 @@ index 00000000..5ef25093
 +                }
 +            })
 +            .addLast(PipelineUtils.SERVER_CHILD);
-+            pipeline.replace(PEPongHandler.NAME, PEPongHandler.NAME, new PEPongHandler());
++            pipeline.replace(PongHandler.NAME, PEPongHandler.NAME, PEPongHandler.INSTANCE);
 +            pipeline.replace(PipelineUtils.FRAME_DECODER, PipelineUtils.FRAME_DECODER, new ChannelInboundHandlerAdapter());
 +            pipeline.replace(PipelineUtils.FRAME_PREPENDER, PipelineUtils.FRAME_PREPENDER, new ChannelInboundHandlerAdapter());
 +            pipeline.get(MinecraftDecoder.class).setProtocolVersion(ProtocolConstants.MINECRAFT_PE_1_8);
-+            channel.eventLoop().execute(() -> {
-+                //move this to the top of the pipeline
-+                channel.pipeline().remove(PipelineUtils.TIMEOUT_HANDLER);
-+                channel.pipeline().addFirst(PipelineUtils.TIMEOUT_HANDLER, new ReadTimeoutHandler( BungeeCord.getInstance().config.getTimeout(), TimeUnit.MILLISECONDS ));
-+            });
++            moveTimeout(channel);
 +        }
 +    };
++
++    public static void moveTimeout(Channel channel) {
++        channel.eventLoop().execute(() -> {
++            //move timeout to the top of the pipeline
++            channel.pipeline().remove(PipelineUtils.TIMEOUT_HANDLER);
++            channel.pipeline().addFirst(PipelineUtils.TIMEOUT_HANDLER,
++                    new ReadTimeoutHandler( BungeeCord.getInstance().config.getTimeout(), TimeUnit.MILLISECONDS ));
++        });
++    }
++
++    public static void multiServerBootstrap(ChannelFutureListener listener, Logger logger, Supplier<ServerBootstrap> f) {
++        final ServerBootstrap bootstrap = f.get();
++        if (PipelineUtils.getDatagramChannel().equals(EpollDatagramChannel.class) && REUSE_LISTENERS > 1) {
++            logger.info("Epoll enabled, creating " + REUSE_LISTENERS + " RakNet sockets with SO_REUSEPORT");
++            bootstrap.option(UnixChannelOption.SO_REUSEPORT, true);
++            for (int i = 0 ; i < REUSE_LISTENERS ; i++) {
++                bootstrap.clone().bind().addListener(listener);
++            }
++        } else {
++            bootstrap.bind().addListener(listener);
++        }
++    }
 +
 +    @RequiredArgsConstructor
 +    public static final class ServerChannel extends ChannelInitializer<Channel> {
@@ -2167,6 +2813,7 @@ index 00000000..5ef25093
 +                    }
 +                });
 +            });
++            channel.config().setWriteBufferWaterMark(SERVER_MARK);
 +            channel.pipeline()
 +            .addLast(new PEProxyServerInfoHandler(bungee, listener))
 +            .addLast(new QueryHandler(bungee, listener));
@@ -2175,21 +2822,27 @@ index 00000000..5ef25093
 +}
 diff --git a/proxy/src/main/java/network/ycc/waterdog/pe/PEPongHandler.java b/proxy/src/main/java/network/ycc/waterdog/pe/PEPongHandler.java
 new file mode 100644
-index 00000000..59a9c22a
+index 00000000..08d67c4b
 --- /dev/null
 +++ b/proxy/src/main/java/network/ycc/waterdog/pe/PEPongHandler.java
-@@ -0,0 +1,18 @@
+@@ -0,0 +1,24 @@
 +package network.ycc.waterdog.pe;
 +
 +import io.netty.buffer.Unpooled;
++import io.netty.channel.ChannelHandler;
 +import io.netty.channel.ChannelHandlerContext;
++
 +import net.md_5.bungee.protocol.PacketWrapper;
 +import net.md_5.bungee.protocol.packet.KeepAlive;
++
 +import network.ycc.raknet.RakNet;
 +import network.ycc.raknet.packet.Pong;
 +import network.ycc.raknet.pipeline.PongHandler;
 +
++@ChannelHandler.Sharable
 +public class PEPongHandler extends PongHandler {
++    public static final PEPongHandler INSTANCE = new PEPongHandler();
++
 +    @Override
 +    protected void channelRead0(ChannelHandlerContext ctx, Pong pong) {
 +        super.channelRead0(ctx, pong);
@@ -2199,10 +2852,10 @@ index 00000000..59a9c22a
 +}
 diff --git a/proxy/src/main/java/network/ycc/waterdog/pe/PEProxyServerInfoHandler.java b/proxy/src/main/java/network/ycc/waterdog/pe/PEProxyServerInfoHandler.java
 new file mode 100644
-index 00000000..f6cac478
+index 00000000..66563ead
 --- /dev/null
 +++ b/proxy/src/main/java/network/ycc/waterdog/pe/PEProxyServerInfoHandler.java
-@@ -0,0 +1,146 @@
+@@ -0,0 +1,148 @@
 +package network.ycc.waterdog.pe;
 +
 +import io.netty.buffer.ByteBuf;
@@ -2274,8 +2927,10 @@ index 00000000..f6cac478
 +            final ByteBuf tmpBuf = ctx.alloc().ioBuffer(pong.sizeHint());
 +            try {
 +                config.getCodec().encode(pong, tmpBuf);
-+                ctx.writeAndFlush(new DatagramPacket(tmpBuf.retain(), sender))
-+                        .addListener(ChannelFutureListener.FIRE_EXCEPTION_ON_FAILURE);
++                for (int i = 0 ; i < 3; i++) { //send multiple responses for bad connections
++                    ctx.writeAndFlush(new DatagramPacket(tmpBuf.retainedSlice(), sender))
++                            .addListener(ChannelFutureListener.FIRE_EXCEPTION_ON_FAILURE);
++                }
 +            } finally {
 +                ReferenceCountUtil.safeRelease(pong);
 +                tmpBuf.release();
@@ -2349,9 +3004,217 @@ index 00000000..f6cac478
 +    }
 +
 +}
+diff --git a/proxy/src/main/java/network/ycc/waterdog/pe/PEResourcePackManager.java b/proxy/src/main/java/network/ycc/waterdog/pe/PEResourcePackManager.java
+new file mode 100644
+index 00000000..0ed42cee
+--- /dev/null
++++ b/proxy/src/main/java/network/ycc/waterdog/pe/PEResourcePackManager.java
+@@ -0,0 +1,89 @@
++package network.ycc.waterdog.pe;
++
++import network.ycc.waterdog.pe.packet.PEResourcePack;
++import network.ycc.waterdog.pe.packet.PEResourceStack;
++
++import io.netty.channel.Channel;
++
++import java.io.File;
++import java.io.FileNotFoundException;
++
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.Map;
++import java.util.UUID;
++import java.util.logging.Logger;
++
++import net.md_5.bungee.connection.InitialHandler;
++
++public class PEResourcePackManager {
++    public static final PEResourcePackManager INSTANCE = new PEResourcePackManager();
++
++    private boolean loaded = false;
++    private PEResourcePackData[] resourcePacks = new PEResourcePackData[0];
++    private PEResourcePackData[] behaviorPacks = new PEResourcePackData[0];
++    private Map<UUID, PEResourcePackData> packMap = new HashMap<>();
++
++    private PEResourcePackManager() {}
++
++    public synchronized void load(Logger logger) {
++        if (loaded) {
++            return;
++        }
++        loaded = true;
++
++        final ArrayList<PEResourcePackData> rPacks = new ArrayList<>();
++        final ArrayList<PEResourcePackData> bPacks = new ArrayList<>();
++        File packsDir = new File("packs");
++
++        if (!packsDir.exists()) {
++            packsDir.mkdir();
++        }
++
++        for (File file : packsDir.listFiles()) {
++            try {
++                if (file.toString().toLowerCase().endsWith(".mcpack")) {
++                    rPacks.add(new PEZippedResourcePackData(file));
++                    logger.info("Loaded resource pack " + file.getName());
++                } else if (file.toString().toLowerCase().endsWith(".mcaddon")) {
++                    bPacks.add(new PEZippedResourcePackData(file));
++                    logger.info("Loaded behavior pack " + file.getName());
++                } else {
++                    continue;
++                }
++            } catch (FileNotFoundException e) {
++                logger.warning("File missing in pack " + file.getName() + ": " + e.getMessage());
++            } catch (Exception e) {
++                logger.warning("Failed to load pack " + file.getName() + ": " + e.getMessage());
++            }
++        }
++
++        //TODO: check for duplicates?
++        rPacks.forEach(pack -> packMap.put(pack.getUuid(), pack));
++        bPacks.forEach(pack -> packMap.put(pack.getUuid(), pack));
++
++        resourcePacks = rPacks.toArray(resourcePacks);
++        behaviorPacks = rPacks.toArray(behaviorPacks);
++    }
++
++    public PEResourcePackData get(UUID uuid) {
++        return packMap.get(uuid);
++    }
++
++    public boolean hasPacks() {
++        return resourcePacks.length != 0 || behaviorPacks.length != 0;
++    }
++
++    //TODO: lets figure out an async pattern here eventually, shave off some RAM
++    public void sendPackDataChunk(Channel channel, UUID uuid, int chunkIndex, int version) {
++        PERawPacketData.injectResourcePackData(channel, packMap.get(uuid), chunkIndex, version);
++    }
++
++    public void sendResourcePack(InitialHandler handler) {
++        handler.unsafe().sendPacket(new PEResourcePack(hasPacks(), resourcePacks, behaviorPacks));
++    }
++
++    public void sendResourceStack(InitialHandler handler) {
++        handler.unsafe().sendPacket(new PEResourceStack(hasPacks(), true, resourcePacks, behaviorPacks));
++    }
++}
+diff --git a/proxy/src/main/java/network/ycc/waterdog/pe/PEZippedResourcePackData.java b/proxy/src/main/java/network/ycc/waterdog/pe/PEZippedResourcePackData.java
+new file mode 100644
+index 00000000..41665af3
+--- /dev/null
++++ b/proxy/src/main/java/network/ycc/waterdog/pe/PEZippedResourcePackData.java
+@@ -0,0 +1,107 @@
++package network.ycc.waterdog.pe;
++
++import io.netty.buffer.ByteBuf;
++import io.netty.buffer.PooledByteBufAllocator;
++
++import java.io.File;
++import java.io.FileNotFoundException;
++import java.io.IOException;
++
++import java.io.InputStreamReader;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.security.MessageDigest;
++import java.security.NoSuchAlgorithmException;
++import java.util.UUID;
++
++import java.util.zip.ZipEntry;
++import java.util.zip.ZipFile;
++
++import com.google.common.base.Preconditions;
++import com.google.gson.JsonArray;
++import com.google.gson.JsonObject;
++import com.google.gson.JsonParser;
++
++import lombok.EqualsAndHashCode;
++
++import lombok.Getter;
++import lombok.ToString;
++import net.md_5.bungee.protocol.DefinedPacket;
++import net.md_5.bungee.protocol.ProtocolConstants;
++
++@EqualsAndHashCode
++@ToString
++public class PEZippedResourcePackData implements PEResourcePackData {
++    @Getter
++    private final String name;
++    @Getter
++    private final UUID uuid;
++    @Getter
++    private final String version;
++    @Getter
++    private final byte[] sha256;
++    private final ByteBuf data;
++
++    public PEZippedResourcePackData(File file) throws IOException, IllegalArgumentException {
++        if (!file.exists()) {
++            throw new FileNotFoundException(file.toString());
++        }
++
++        final JsonObject manifest;
++        try (final ZipFile zip = new ZipFile(file)) {
++            final ZipEntry manifestEntry = zip.getEntry("manifest.json");
++            if (manifestEntry == null) {
++                throw new FileNotFoundException("manifest.json" + " in " + file.toString());
++            }
++
++            manifest = new JsonParser()
++                    .parse(new InputStreamReader(zip.getInputStream(manifestEntry), StandardCharsets.UTF_8))
++                    .getAsJsonObject();
++        }
++        checkForField(manifest, "format_version");
++        checkForField(manifest, "header");
++        checkForField(manifest, "modules");
++
++        final JsonObject header = manifest.getAsJsonObject("header");
++        checkForField(header, "description");
++        checkForField(header, "name");
++        checkForField(header, "uuid");
++        checkForField(header, "version");
++
++        final JsonArray versionArr = header.get("version").getAsJsonArray();
++
++        final byte[] fileData = Files.readAllBytes(file.toPath());
++        data = PooledByteBufAllocator.DEFAULT.ioBuffer(fileData.length).writeBytes(fileData);
++
++        try {
++            sha256 = MessageDigest.getInstance("SHA-256").digest(fileData);
++        } catch (NoSuchAlgorithmException e) {
++            throw new RuntimeException("This JVM does not support SHA-256 digest", e);
++        }
++
++        name = header.get("name").getAsString();
++        uuid = UUID.fromString(header.get("uuid").getAsString());
++        version = versionArr.get(0).getAsString() + "." +
++                  versionArr.get(1).getAsString() + "." +
++                  versionArr.get(2).getAsString();
++    }
++
++    protected static void checkForField(JsonObject obj, String key1) {
++        Preconditions.checkArgument(obj.has(key1), "Manifest missing " + key1);
++    }
++
++    public void writeChunk(int chunkIndex, ByteBuf to, int version) {
++        final int offset = chunkIndex * CHUNK_SIZE;
++        final int length = Math.min(getSize() - offset, CHUNK_SIZE);
++        if (version >= ProtocolConstants.MINECRAFT_PE_1_13) {
++            DefinedPacket.writeVarInt(length, to);
++        } else {
++            to.writeIntLE(length);
++        }
++        to.writeBytes(data, data.readerIndex() + offset, length);
++    }
++
++    public int getSize() {
++        return data.readableBytes();
++    }
++}
 diff --git a/proxy/src/main/java/protocolsupport/protocol/connection/PSInitEncapsulation.java b/proxy/src/main/java/protocolsupport/protocol/connection/PSInitEncapsulation.java
 new file mode 100644
-index 00000000..78490b27
+index 00000000..36072583
 --- /dev/null
 +++ b/proxy/src/main/java/protocolsupport/protocol/connection/PSInitEncapsulation.java
 @@ -0,0 +1,40 @@
@@ -2376,7 +3239,7 @@ index 00000000..78490b27
 +    private final boolean compression;
 +
 +    @Override
-+    public void channelActive(ChannelHandlerContext ctx) throws Exception {
++    public void channelActive(ChannelHandlerContext ctx) {
 +        final ByteBuf to = ctx.alloc().heapBuffer();
 +        to.writeByte(HANDSHAKE_ID);
 +        DefinedPacket.writeVarInt(CURRENT_VERSION, to);
@@ -2391,7 +3254,7 @@ index 00000000..78490b27
 +        }
 +        to.writeBoolean(compression);
 +        ctx.writeAndFlush(to);
-+        super.channelActive(ctx);
++        ctx.fireChannelActive();
 +        ctx.pipeline().remove(this);
 +    }
 +}
